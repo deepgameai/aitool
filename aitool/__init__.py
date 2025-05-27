@@ -9,6 +9,8 @@
 from aitool.r3_datasets import PATH as DATA_PATH
 # web data path
 from aitool.config import DATASET_WEB as WEB_PATH, USER_CONFIG
+# other path
+from aitool.r4_algorithm.llm.autoprompt import PATH as AUTOPROMPT_PATH
 
 # r0_standard
 # 仅依赖python标准库
@@ -16,6 +18,7 @@ from aitool.r0_standard.retry import retry
 from aitool.r0_standard.time_op import exe_time, timeout, format_time, timestamp, get_lastday_timestamp
 from aitool.r0_standard.print_op import print_color, print_red, print_green, print_yellow, print_blue
 from aitool.r0_standard.dict_op import split_dict
+from aitool.r0_standard.list_op import get_batch
 from aitool.r0_standard.random_op import weight_random, random_base64
 from aitool.r0_standard.scoring import apr
 from aitool.r0_standard.security import encrypt_md5
@@ -71,7 +74,36 @@ from aitool.r4_algorithm.graph.paris.objects.KGs import KGs
 from aitool.r4_algorithm.graph.paris.tool.dataloader import construct_kg
 from aitool.r4_algorithm.graph.paris.examples.core_example import alignment
 from aitool.r4_algorithm.interface.mt_google import translate, recognize_language
-from aitool.r4_algorithm.interface.doubao import infer_doubao
+from aitool.r4_algorithm.interface.doubao import infer_doubao, infer_doubao_vision, get_doubao_img_base64
 from aitool.r4_algorithm.llm.infer.baichuan import infer_baichuan
-from aitool.r4_algorithm.llm.autoprompt.unit import AutoPrompt
-from aitool.r4_algorithm.llm.autoprompt.interface import AutoPromptApp
+from aitool.r4_algorithm.llm.autoprompt.unit import AutoPrompt, InputIdx, OutputIdx, LabelIdx, CommentIdx
+from aitool.r4_algorithm.llm.autoprompt.interface import get_auto_prompt_app
+
+
+# r8_task
+from aitool.r8_task.tos.tos import send_text2tos, send_file2tos
+from aitool.r8_task.keyword_mining.keyword_mining import get_keyword_graph, get_keyword_graph4panda, \
+    get_keyword, SentenceKeyword
+from aitool.r8_task.keyword_mining.contact_information import ContactInformation, get_contact
+from aitool.r8_task.keyword_mining.pos_filter import POSFilter, is_pos_valid, filter_words_with_pos
+from aitool.r8_task.dorado.sql_utils import sql_collect, is_available, sql_result2list, sql_result2text, \
+    sql_controller, customize_sentence_clear, get_keyword2fields, sql_line2header
+from aitool.r8_task.dorado.alert_message import send_feishu_msg, send_feishu_sheet, send_alert_msg, dump_feishu_sheet, send_text
+from aitool.r8_task.dorado.sql.sql_user_report import sql_user_report, sql_user_report_comment
+from aitool.r8_task.dorado.sql.sql_user_profile import sql_user_profile, sql_user_profile_blue
+from aitool.r8_task.dorado.sql.sql_comment import sql_comment, sql_comment_extend
+from aitool.r8_task.dorado.sql.sql_message import sql_message
+from aitool.r8_task.dorado.sql.sql_video_similar import sql_video_similar, get_video_similar
+from aitool.r8_task.dorado.sql.sql_video_info import sql_uid2video_info, sql_vid2video_info
+from aitool.r8_task.dorado.sql.sql_keyword_rank import sql_video_keyword_rank, \
+    sql_video_keyword_rank_with_collect_set
+from aitool.r8_task.dorado.structure import User, Obj, Report, Comment, Message, Device, Ip
+from aitool.r8_task.dorado.risk_discover import load_data as load_data4risk, search_same_comment, \
+    search_massive_message, bad_report, dense_comment, effective_reporter, success_rate_reporter
+from aitool.r8_task.dorado.points_extend import get_similar
+from aitool.r8_task.dorado.action_extend import action_extend
+from aitool.r8_task.dorado.auto_sql import auto_sql, Colloquial, get_sentence_idf
+from aitool.r8_task.dorado.case_extension import case_extension, refactor_auto_sql
+from aitool.r8_task.get_risk.get_risk import get_risk
+from aitool.r8_task.dorado.case_extension_eval import case_extension_eval
+from aitool.r8_task.association.association_analysis import get_video_similarity, find_gang

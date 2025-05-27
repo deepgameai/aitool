@@ -21,11 +21,11 @@ from tqdm import tqdm
 from collections import defaultdict
 from aitool import load_csv, load_pickle, dump_lines
 
-file_1_uid = '/Users/bytedance/Downloads/281475002856177-graph_online-1. 主要uid：处罚uid-查询23.csv'
-file_2_uid_did = '/Users/bytedance/Downloads/281475002856178-graph_online-2. 扩展uid：与主要uid设备1跳关联-查询8.csv'
-file_3_uid_info = '/Users/bytedance/Downloads/281475002856180-graph_online-3.uid属性：昵称+签名-查询5.csv'
-file_4_uid_title = '/Users/bytedance/Downloads/281475002856181-graph_online-4.vid信息：uid, title, asr, ocr-查询8.csv'
-file_5_uid_group_id = '/Users/bytedance/Downloads/281475002884053-graph_online-5.扩展uid_ group_id扩散-查询5.csv'
+file_1_uid = '主要uid：处罚uid-查询23.csv'
+file_2_uid_did = '扩展uid：与主要uid设备1跳关联-查询8.csv'
+file_3_uid_info = 'uid属性：昵称+签名-查询5.csv'
+file_4_uid_title = 'vid信息：uid, title, asr, ocr-查询8.csv'
+file_5_uid_group_id = '扩展uid_ group_id扩散-查询5.csv'
 
 uid_core = load_csv(file_1_uid, to_list=True)
 uid_did = load_csv(file_2_uid_did, to_list=True)

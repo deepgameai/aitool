@@ -17,9 +17,9 @@
 """
 import os
 import logging
-from typing import Tuple, List, Any
+from typing import Tuple, List, Any, Dict
 from time import sleep, time, gmtime, strftime
-from aitool import get_current_path, singleton, timestamp, dump_lines
+from aitool import get_current_path, singleton, timestamp, is_file_exist, make_dir, abspath
 
 
 @singleton
@@ -80,34 +80,35 @@ def get_log(*args, **kwargs) -> logging.Logger:
     return log_set.get_log(*args, **kwargs)
 
 
-
 class Record:
-    def __init__(self, interval: float = 10, show: bool = True, name: str = ''):
+    def __init__(self, interval: float = 10, show: bool = False, name: str = '', max_char = 3000):
         self.name = name
-        self.record_file = './record/record_{}_{}.txt'.format(self.name, timestamp(style='sec'))
-        self.record_info = []
+        self.record_file = abspath('./record/record_{}_{}.txt'.format(self.name, timestamp(style='sec')))
+        print('record file', self.record_file)
         self.time_init = time()
         self.show = show
         self.time_last_display = 0
         self.interval = interval    # 距离上次输出的间隔时间
+        self.max_char = max_char
 
-    def note(self, data: Tuple[str, Any], finish: bool = False, max_line: int = 1000):
+    def note(self, data: Tuple[str, Any], finish: bool = False, max_line: int = 10000, max_char: int = None):
         """列表类型的数据只输出前20列"""
-        self.record_info.append([data, time()-self.time_init])
-        if self.show:
-            print('{:.1f}s'.format(time()-self.time_init), data)
-
-        if time() - self.time_last_display >= self.interval or finish:
-            self.time_last_display = time()
-            record_output = []
-            for line, timer in self.record_info:
-                content = line[1]
-                if isinstance(line[1], List):
-                    content = '\n'.join(['{}'.format(_) for _ in line[1][:max_line]])
-                record_output.append('【{} :: {}】'.format(line[0], strftime("%H:%M:%S", gmtime(timer))))
-                record_output.append('{}\n\n'.format(content))
-
-            dump_lines(record_output, self.record_file)
+        max_char = self.max_char if max_char is None else max_char
+        if not is_file_exist(self.record_file):
+            make_dir(self.record_file, file=True)
+        with open(self.record_file, 'a+') as f_out:
+            name, content = data
+            time_now = strftime("%H:%M:%S", gmtime(time()-self.time_init))
+            if isinstance(content, List):
+                content = '\n'.join(['{}'.format(_) for _ in content[:max_line]])
+            content = '{}'.format(content)
+            if len(content) > max_char:
+                content = content[:max_char]
+            if self.show:
+                print('【{} :: {}】'.format(name, time_now))
+                print('{}\n\n'.format(content))
+            f_out.write('【{} :: {}】'.format(name, time_now))
+            f_out.write('{}\n\n'.format(content))
 
     def finish(self):
         """进行一次输出"""

@@ -39,7 +39,7 @@ def weight_random(weight: List[float]) -> int:
             return i
 
 
-def random_base64(length: int = 64, no_symbol=True, seed: str = None) -> str:
+def random_base64(length: int = 16, no_symbol=True, seed: str = None) -> str:
     """
     生成一个base64格式的随机字符串
 
@@ -51,7 +51,11 @@ def random_base64(length: int = 64, no_symbol=True, seed: str = None) -> str:
     >>> print('Random64: ', random_base64(length=16))  # doctest: +SKIP
     Random64:  Ipx1BV0fAMwcFCCB
     >>> print('Random64: ', random_base64(seed='ABCDE'))
-    Random64:  QUJDREUA
+    Random64:  QUJDREUA00000000
+    >>> print('Random64: ', random_base64(length=16, seed='半人马，是个战士，能保护队友'))
+    Random64:  5Y2K5Lq66ams77yM
+    >>> print('Random64: ', random_base64(length=16, seed='一位神秘的女巫，她的头发是白色的，戴着一顶尖帽子，身穿黑色的长袍'))
+    Random64:  5LiA5L2N56We56eY
     """
     if seed is None:
         seed = randint(0, 2 ** (8 * length // 4 * 3)).to_bytes(length // 4 * 3, "little")
@@ -62,6 +66,9 @@ def random_base64(length: int = 64, no_symbol=True, seed: str = None) -> str:
         text = text.replace('-', 'A')
         text = text.replace('_', 'A')
         text = text.replace('=', 'A')
+    if len(text) < length:
+        text = text + '0' * (length - len(text))
+    text = text[:length]
     return text
 
 

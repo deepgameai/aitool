@@ -2,14 +2,16 @@
 import math
 from collections import defaultdict, Counter
 from random import sample, randint, shuffle
-from time import sleep, time, gmtime, strftime
-from typing import List, Tuple, Any, Dict, Callable
-
+from time import sleep, gmtime, strftime
+from typing import List, Tuple, Dict, Callable, Any
+import os
 from tqdm import tqdm
 
-from aitool import ngram_sim, split_punctuation, is_punctuation, infer_doubao, Record
+from aitool import (AUTOPROMPT_PATH, ngram_sim, split_punctuation, is_punctuation, infer_doubao, Record, get_batch,
+                    load_json, infer_doubao_vision)
 
-Input = str
+InputPics = List[str]   # 是用豆包特定的base64格式
+Input = Dict[str, Any]
 Output = str
 Label = str
 Comment = str
@@ -22,6 +24,7 @@ Prompt = str
 LabeledCase = Tuple[Output, Label, Input, Comment]
 Generation = 'generation'
 Classification = 'classification'
+CLSAnalysis = 'cls_analysis'
 
 
 class UndefinedTask(Exception):
@@ -45,11 +48,25 @@ class AutoPrompt:
             iteration: int = 2,
             target_inputs: List[Input] = None,
             target_size: int = 100,
-            split_subtask: bool = False,    # split_subtask = True 还需要多实验各种极端情况, 默认还是设置False
-            auto_task_kind: bool = True,    # task_kind is None 时有效
+            split_subtask: bool = False,  # split_subtask = True 还需要多实验各种极端情况, 默认还是设置False
+            auto_task_kind: bool = True,  # task_kind is None 时有效
             task_kind: str = None,
             name: str = '',
-            llm_interface: Callable = infer_doubao,
+            llm_interface: Callable = infer_doubao,     #
+            vllm_interface: Callable = infer_doubao_vision,     #
+            llm_teacher_interface: Callable = infer_doubao,     # 用来评估prompt->文本优劣的llm
+            vllm_teacher_interface: Callable = infer_doubao_vision,     #
+            skip_old_data: bool = False,
+            ratio_fixed: float = 0.1,
+            ratio_new: float = 0.7,
+            ratio_hard: float = 0.2,
+            bad_cases_num: int = 7,
+            good_cases_num: int = 3,
+            no_example_in_prompt: bool = False,
+            show_print: bool = False,
+            use_all_propose: bool = False,
+            has_pic: bool = False,
+            has_video: bool = False,
     ):
         """
         自动优化prompt
@@ -67,7 +84,19 @@ class AutoPrompt:
         :param auto_task_kind: 自动判断任务类型
         :param task_kind: 任务类型
         :param name: 任务名
-        :param llm_interface: 调用大模型接口
+        :param llm_interface: 用来生成文本的llm接口
+        :param vllm_interface: 用来理解图片的llm接口
+        :param llm_teacher_interface: 用来评估prompt->文本优劣的llm接口
+        :param vllm_teacher_interface: 用来评估prompt->图片理解优劣的llm接口
+        :param skip_old_data: 验证集上不使用旧的数据
+        :param ratio_fixed: 固定的验证数据占比
+        :param ratio_new: 新的验证数据占比
+        :param ratio_hard: 困难的验证数据占比
+        :param no_example_in_prompt: prompt里面不带example以免图片携带问题
+        :param show_print: note是否print
+        :param use_all_propose: 是否使用全部的propose
+        :param has_pic: 输入里面是否包含图片
+        :param has_video: 输入里面是否包含视频
         """
         self.task = task
         self.dataset = dataset if dataset is not None else []
@@ -84,17 +113,36 @@ class AutoPrompt:
         self.task_kind = task_kind
         self.task_name = name
         self.llm_interface = llm_interface
-        self.record = Record(name=self.task_name)
-        self.note_params()
+        self.vllm_interface = vllm_interface
+        self.llm_teacher_interface = llm_teacher_interface
+        self.vllm_teacher_interface = vllm_teacher_interface
+        self.use_all_propose = use_all_propose
+        self.has_pic = has_pic
+        self.has_video = has_video
+
+        self.templates = load_json(os.path.join(AUTOPROMPT_PATH, 'templates.json'))
+
+        self.skip_old_data = skip_old_data
+        self.ratio_fixed = ratio_fixed
+        self.ratio_new = ratio_new
+        self.ratio_hard = ratio_hard
+
+        # 如果不跳过历史轮次评测数据就需要将测试集的改为固定参数
+        if not self.skip_old_data:
+            self.ratio_fixed = 1.0
+            self.ratio_new = 0.0
+            self.ratio_hard = 0.0
 
         self.output_limited = False
         self.all_allowed_outputs = []
-        self.good_case = []
+        self.good_cases = []
         self.inspector_prompt = None
         self.subtasks = []
         self.subdatasets = []
+        self.prompt2idx = defaultdict(str)
         self.all_final_prompts = []
         self.prompt2case = {}
+        self.prompt_score = []
         self.prompt2gradient = defaultdict(list)
         self.output_prompts = []
         self.output_case_texts = []
@@ -103,12 +151,131 @@ class AutoPrompt:
         # 分类任务专属
         self.is_multi_label = False
         self.split_punctuation = ','  # 多分类任务用来拼接label的符号
+        self.validate_new_idx = 0
+        self.window_size_fixed = int(self.window_size * self.ratio_fixed)
+        self.window_size_new = int(self.window_size * self.ratio_new)
+        self.window_size_hard = int(self.window_size * self.ratio_hard)
         self.validate_cases = []
-        self.validate_inputs = []
+        self.validate_cases_fixed = []
+        self.validate_cases_new = []
+        self.validate_cases_hard = []
+        self.validate_cases_hard_next = []
         self.prompt2precision = {}
         self.prompt2wrong_cases_str = {}
 
-    def work(self) -> Tuple[List[Prompt], List[Input], List[Output]]:
+        # 分类解析任务专属
+        self.bad_cases_num = bad_cases_num
+        self.good_cases_num = good_cases_num
+        self.label2tips = defaultdict(list)
+        self.label2fitips = {}
+
+        # 视觉任务专属
+        self.no_example_in_prompt = no_example_in_prompt
+        self.show_print = show_print
+
+        self.record = Record(name=self.task_name, show=show_print)
+        self.note_params()
+
+        # 兼容历史版本的输入LabeledCase=Tuple[Output, Label, Input, Comment]
+        self.update_dataset()
+
+    def update_input(self, the_input):
+        if the_input is None:
+            return {'text': '', 'pic_list': [], 'pic_type': ''}
+        if isinstance(the_input, str):
+            return {'text': the_input, 'pic_list': [], 'pic_type': ''}
+        return the_input
+
+    def update_dataset(self):
+        # 兼容历史版本的数据输入格式
+        new_dataset = []
+        for case in self.dataset:
+            if isinstance(case[InputIdx], str):
+                new_input = self.update_input(case[InputIdx])
+                new_dataset.append(('{}'.format(case[OutputIdx]), case[LabelIdx], new_input, case[CommentIdx]))
+            elif isinstance(case[InputIdx], Dict):
+                if 'text' not in case[InputIdx]:
+                    case[InputIdx]['text'] = ''
+                if 'pic_list' not in case[InputIdx]:
+                    case[InputIdx]['pic_list'] = []
+                if 'pic_type' not in case[InputIdx]:
+                    case[InputIdx]['pic_type'] = ''
+                new_dataset.append(case)
+            else:
+                raise ValueError('未知的历史版本数据输入格式')
+        self.dataset = new_dataset
+
+    def get_prompts(self) -> List[Prompt]:
+        # 迭代prompt
+        for subtask, subdataset in zip(self.subtasks, self.subdatasets):
+            prompt_init = self.task2prompt(subtask, subdataset)
+            for idx, prompt in enumerate(prompt_init):
+                self.prompt2idx[prompt] = 'init_{}'.format(idx)
+            self.record.note(('subtask', subtask))
+            self.record.note(('subdataset', subdataset))
+            self.record.note(('prompt_init', prompt_init))
+            self.all_final_prompts.append(self.beam_search(subtask, prompt_init, subdataset, self.iteration))
+
+        self.record.note(('output_prompts', self.all_final_prompts))
+        return self.all_final_prompts
+
+    def get_outputs(self, prompts: List[str] = None) -> Tuple[List[Input], List[Output]]:
+        # 批量生成数据
+        self.infer_inputs(prompts)
+        self.record.note(('output_case_inputs', self.output_case_inputs))
+        self.record.note(('output_case_texts', self.output_case_texts))
+        self.record.finish()
+        return self.output_case_inputs, self.output_case_texts
+
+    def get_tip_str(self):
+        rst = ''
+        for label, tips in self.label2tips.items():
+            rst += '{}: {}\n'.format(label, '。'.join(tips))
+        return rst
+
+    def get_tip(self, all_wrong_cases, all_wrong_outputs, all_right_cases, prompt, label):
+        wrong_cases_str, pic_lists, pic_type = self.get_wrong_cases_str(all_wrong_cases, all_wrong_outputs)
+        all_predict_cases = [(output, case[LabelIdx], case[InputIdx], case[CommentIdx]) for case, output
+                             in zip(all_right_cases, all_wrong_outputs)]
+        propose = self.analysis_case2good(all_predict_cases, all_right_cases, prompt,
+                                          wrong_cases_str=wrong_cases_str, label=label)
+        self.label2tips[label].append(propose)
+
+    def get_tips(self):
+        label2case = defaultdict(list)
+        for case in self.good_cases:
+            label2case[case[OutputIdx]].append(case)
+        prompt_init = self.task2prompt(self.subtasks[0], self.subdatasets[0])
+        prompt = prompt_init[0]
+
+        iteration = 0
+        while iteration < self.iteration:
+            iteration += 1
+            prompt = self.merge_prompt(prompt, self.get_tip_str())
+
+            for label in label2case:
+                all_right_cases = []
+                all_wrong_cases = []
+                all_wrong_outputs = []
+                for case_golden in tqdm(get_batch(label2case[label][:self.target_size], self.window_size), label):
+                    case_inputs = [case[InputIdx] for case in case_golden]
+                    case_predicted = self.get_cases(prompt, len(case_inputs), case_inputs, do_variety=False)
+                    right_cases, wrong_cases, wrong_outputs = self.check_response(case_predicted, case_golden)
+                    all_right_cases.extend(right_cases)
+                    all_wrong_cases.extend(wrong_cases)
+                    all_wrong_outputs.extend(wrong_outputs)
+                    if (len(all_right_cases) >= self.good_cases_num) and (len(all_wrong_cases) >= self.bad_cases_num):
+                        self.get_tip(all_wrong_cases, all_wrong_outputs, all_right_cases, prompt, label)
+                        all_right_cases = []
+                        all_wrong_cases = []
+                        all_wrong_outputs = []
+                if len(all_right_cases) > 0:
+                    self.get_tip(all_wrong_cases, all_wrong_outputs, all_right_cases, prompt, label)
+
+        for label in self.label2tips:
+            self.label2fitips[label] = self.get_final_tips(label)
+
+    def work(self):
         if self.task_kind is not None:
             self.auto_task_kind = False
         if self.auto_task_kind:
@@ -126,6 +293,7 @@ class AutoPrompt:
         self.time_estimate()
 
         self.good_cases = self.pick_dataset(self.dataset, self.label_good, len(self.dataset))
+        shuffle(self.good_cases)
 
         if self.task_kind == Generation:
             # 检查器（用于分类和修正），在全部数据上获取，不针对子任务
@@ -137,28 +305,22 @@ class AutoPrompt:
             # 分类任务不支持 subtask
             assert self.split_subtask is False
             # 分类任务从全量数据中筛选出一个评测集。TODO 优先保证正负样本均衡，然后在案input占比分配case
-            self.validate_cases, _ = self.split_dataset(self.good_cases, self.window_size, balance_idx=OutputIdx)
-            shuffle(self.validate_cases)
-            self.validate_inputs = [case[InputIdx] for case in self.validate_cases]
+            self.validate_cases_fixed, _ = self.split_dataset(self.good_cases, self.window_size_fixed,
+                                                              balance_idx=OutputIdx)
+            self.record.note(('validate_cases_fixed', self.validate_cases_fixed))
+        elif self.task_kind == CLSAnalysis:
+            # 分类分析任务不支持 subtask
+            assert self.split_subtask is False
         else:
             raise UndefinedTask
 
-        # 迭代prompt
-        for subtask, subdataset in zip(self.subtasks, self.subdatasets):
-            prompt_init = self.task2prompt(subtask, subdataset)
-            self.record.note(('subtask', subtask))
-            self.record.note(('subdataset', subdataset))
-            self.record.note(('prompt_init', prompt_init))
-            self.all_final_prompts.append(self.beam_search(subtask, prompt_init, subdataset, self.iteration))
-
-        # 批量生成数据
-        self.infer_inputs()
-
-        self.record.note(('output_prompts', self.output_prompts))
-        self.record.note(('output_case_inputs', self.output_case_inputs))
-        self.record.note(('output_case_texts', self.output_case_texts))
-        self.record.finish()
-        return self.output_prompts, self.output_case_inputs, self.output_case_texts
+        if self.task_kind in (Generation, Classification):
+            self.get_prompts()
+            self.get_outputs()
+            return self.output_prompts, self.output_case_inputs, self.output_case_texts
+        elif self.task_kind == CLSAnalysis:
+            self.get_tips()
+            return self.label2fitips
 
     def get_task_kind(self):
         records = [
@@ -167,6 +329,7 @@ class AutoPrompt:
                 [self.task], """第一版"""],
         ]
         template = records[-1][0].format(*records[-1][1])
+        template2 = self.templates['get_task_kind'][-1]['text'].format(self.task)
         rst = self.call_llm(template)
         if '分类任务' in rst:
             self.task_kind = Classification
@@ -208,7 +371,8 @@ class AutoPrompt:
         if not self.output_limited:
             return ''
         allowed_outputs_str = '、'.join(self.all_allowed_outputs)
-        text = '不允许输出额外的推理过程，输出的必须为这些内容中的一个或多个：{}。即使是缺少信息无法判断或与所有可选的输出内容都无关，也只能输出这些内容中的一个或多个：{}。'.format(allowed_outputs_str, allowed_outputs_str)
+        text = '不允许输出额外的推理过程，输出的必须为这些内容中的一个或多个：{}。即使是缺少信息无法判断或与所有可选的输出内容都无关，也只能输出这些内容中的一个或多个：{}。'.format(
+            allowed_outputs_str, allowed_outputs_str)
         return text
 
     def get_classification_type(self):
@@ -240,11 +404,12 @@ class AutoPrompt:
         if len(most_common) > 0:
             self.split_punctuation = most_common[0][0]
 
-    def infer_inputs(self):
+    def infer_inputs(self, prompts: str = None):
         # 批量生成数据
+        if prompts is None:
+            prompts = [final_prompts[0] for final_prompts in self.all_final_prompts]
         task_size = math.ceil(self.target_size / len(self.subtasks))  # 平分要生成的数据量
-        for final_prompts, subdataset in zip(self.all_final_prompts, self.subdatasets):
-            prompt = final_prompts[0]
+        for prompt, subdataset in zip(prompts, self.subdatasets):
             self.output_prompts.append(prompt)
             if self.task_kind == Generation:
                 cases = self.get_cases(
@@ -279,11 +444,20 @@ class AutoPrompt:
         return description
 
     def rewrite_inspector_prompt(self):
-        records = [
-            [
-                """修改分类任务的【原prompt】,要求保持原本的信息不缺失，并将其输出格式修改为：“\n【分类结果】\n（该分类prompt原本的结果，即是否符合要求）。\n【修正后的输入】\n（如果不合符要求就额外输出修正后的输入，使其符合要求。如果已经符合要求，则输出“无需修正”）”。\n\n【原prompt:】\n{}\n\n【修改输出格式后的prompt:】\n""",
-                [self.inspector_prompt], """第一版"""],
-        ]
+        if self.inspector_prompt is None:
+            return
+        if self.has_pic:
+            records = [
+                [
+                    """修改分类任务的【原prompt】,要求保持原本的信息不缺失，并将其输出格式修改为：“\n【分类结果】\n（该分类prompt原本的结果，即是否符合要求）。\n【修正后的输入】\n（如果不合符要求就额外输出修正后的输入，使其符合要求。如果已经符合要求，则输出“无需修正”）”。prompt里的图片数量不应该多余10张，可以是0张即不含任务图片。如果原prompt里有双括号包裹的变量{{变量名}}，则输出的prompt里也应该包含所有双括号包裹的变量，不要丢失变量。\n\n【原prompt:】\n{}\n\n【修改输出格式后的prompt:】\n""",
+                    [self.inspector_prompt], """第一版"""],
+            ]
+        else:
+            records = [
+                [
+                    """修改分类任务的【原prompt】,要求保持原本的信息不缺失，并将其输出格式修改为：“\n【分类结果】\n（该分类prompt原本的结果，即是否符合要求）。\n【修正后的输入】\n（如果不合符要求就额外输出修正后的输入，使其符合要求。如果已经符合要求，则输出“无需修正”）”。\n\n【原prompt:】\n{}\n\n【修改输出格式后的prompt:】\n""",
+                    [self.inspector_prompt], """第一版"""],
+            ]
         template = records[-1][0].format(*records[-1][1])
         self.inspector_prompt = self.call_llm(template)
 
@@ -292,7 +466,7 @@ class AutoPrompt:
         case_bad = self.pick_dataset(self.dataset, self.label_bad, len(self.dataset))
         task = self.generation2classification_task(self.task, self.label_good, self.label_bad)
         dataset = self.generation2classification_dataset(case_good + case_bad)
-        inspector_prompt = ''
+        inspector_prompt = None
         if len(case_good) >= 5 and len(case_bad) >= 5:
             ap = AutoPrompt(
                 task,
@@ -318,7 +492,7 @@ class AutoPrompt:
         for case in dataset:
             c_output, c_label, c_input, c_comment = case
             if len(c_input) > 0:
-                new_input = 'input: ' + c_input + '\noutput: ' + c_output
+                new_input = 'input: ' + '{}'.format(c_input) + '\noutput: ' + c_output
             else:
                 new_input = c_output
             dataset_new.append((c_label, 'good', new_input, c_comment))
@@ -339,24 +513,27 @@ class AutoPrompt:
         # 按target_id列汇总数据
         target2cases = defaultdict(list)
         for labeled_case in dataset:
-            target = labeled_case[target_idx]
+            target = labeled_case[target_idx]['text']
             target2cases[target].append(labeled_case)
         return target2cases
 
     def time_estimate(self):
         """预估耗时。不包含已用于做子任务划分的时间"""
         second_per_call = 4.95  # 平均调用一次大模型的时间(秒)
-        case_per_call = 1.17       # 平均调用一次大模型获得的case数量
+        case_per_call = 1.17  # 平均调用一次大模型获得的case数量
 
         # 生成新的prompt调用llm的次数。每个都先算梯度，再生产，再清洗
         time_propose = 3 * self.beam_size * self.derive_time * self.iteration
         # 计算每个prompt的样例数据调用llm的次数。初始有 self.beam_size 个 prompt。每轮迭代新获得self.beam_size * self.derive_time 个 prompt
         # 每份样例数据要包含 self.window_size 个数据，生成数据后额外需要清洗一次格式
-        time_get_cases = (self.beam_size * self.derive_time * self.iteration + self.beam_size) * (self.window_size / case_per_call + 1)
+        time_get_cases = (self.beam_size * self.derive_time * self.iteration + self.beam_size) * (
+                    self.window_size / case_per_call + 1)
         # 两两对比计算分数调用llm的次数
         if self.task_kind == Generation:
             time_rank_score = (self.beam_size * self.derive_time + self.beam_size) ^ 2
         elif self.task_kind == Classification:
+            time_rank_score = 0
+        elif self.task_kind == CLSAnalysis:
             time_rank_score = 0
         else:
             raise UndefinedTask
@@ -377,26 +554,45 @@ class AutoPrompt:
                 continue
             self.record.note(('参数 :: {}'.format(member), value))
 
-    def call_llm(self, prompt: str, llm: str = 'doubao') -> str:
+    def call_llm(self, the_input: Input, llm: str = 'doubao') -> str:
         """
-        调用大模型生成结果
-        :param prompt:
+        调用大模型生成结果，依据Input情况调用不同模型
+        :param the_input:
         :param llm:
         :return:
         """
-        try_time = 3
-        sleep_second = [0, 120, 60, 30]
+        try_time = 1
+        sleep_second = [0, 1, 1, 1]
         if len(sleep_second) <= try_time:
             raise ValueError('len sleep_second is less than or equal try_time')
+
+        the_input = self.update_input(the_input)
+        prompt = the_input['text']
+        pics = the_input['pic_list'] if 'pic_list' in the_input else []
+        pic_type = the_input['pic_type'] if 'pic_type' in the_input else ''
         while try_time > 0:
             try:
-                self.record.note(('>>> call_llm', prompt))
-                if llm == 'doubao':
-                    rst = self.llm_interface([prompt])
+                if len(pics) == 0:
+                    self.record.note(('>>> call_llm', prompt))
+                    if llm == 'doubao':
+                        rst = self.llm_interface([prompt])
+                    else:
+                        raise ValueError('llm:'.format(llm))
+                    self.record.note(('>>> rst_llm', rst))
+                    return rst
                 else:
-                    raise ValueError('llm:'.format(llm))
-                self.record.note(('>>> rst_llm', rst))
-                return rst
+                    self.record.note(('>>> call_vllm', prompt))
+                    if pic_type in ('base64', 'url'):
+                        if pic_type == 'url':
+                            self.record.note(('>>> call_inputs', the_input))
+                        if llm == 'doubao':
+                            rst = self.vllm_interface(prompt, pics, pic_type)
+                        else:
+                            raise ValueError('llm:'.format(llm))
+                        self.record.note(('>>> rst_llm', rst))
+                        return rst
+                    else:
+                        raise ValueError(pic_type)
             except Exception as e:
                 print(e)
                 sleep(sleep_second[try_time])
@@ -425,7 +621,7 @@ class AutoPrompt:
             good_dataset = self.pick_dataset(dataset, self.label_good, self.window_size)
 
             if len(good_dataset) > 0:
-                example_str = self.get_example_str(good_dataset, min_num=2)
+                example_str, data_pics, pic_type = self.get_example_str(good_dataset, min_num=2)
                 additional_prompt += example_str
 
         # 一次调用生成多个case
@@ -529,38 +725,59 @@ class AutoPrompt:
             # 附加少量（3~4个）示例
             if self.task_kind == Generation:
                 example_cases, _ = self.split_dataset(self.good_cases, randint(3, 4), balance_idx=InputIdx)
-            elif self.task_kind == Classification:
+            elif self.task_kind in (Classification, CLSAnalysis):
                 example_cases, _ = self.split_dataset(self.good_cases, randint(3, 4), balance_idx=OutputIdx)
             else:
                 raise UndefinedTask
             shuffle(example_cases)
-            example_str = self.get_example_str(example_cases, use_all=True)
+            example_str, data_pics, pic_type = self.get_example_str(example_cases, min_num=len(example_cases), max_num=len(example_cases), use_all=True)
+            example_str = self.fill_slot(example_str)
             output_format_str = self.get_output_format_str(task, example_str)
 
         if self.task_kind == Generation:
             if use_rule:
-                records = [
-                    [[
-                        """依据【任务描述】生成数据。生成的多条数据之间用换行符分割。$示例数据$\n$输出限制$\n$输出格式$\n【任务描述:】\n{}\n【生成的数据:】\n""",
-                    ], [task], """第一版"""],
-                ]
+                if self.has_pic:
+                    records = [
+                        [[
+                            """依据【任务描述】生成数据。包含图片数量不应该多余20张。$示例数据$\n$输出限制$\n$输出格式$\n【任务描述:】\n{}\n【生成的数据:】\n""",
+                        ], [task], """第一版"""],
+                    ]
+                else:
+                    records = [
+                        [[
+                            """依据【任务描述】生成数据。$示例数据$\n$输出限制$\n$输出格式$\n【任务描述:】\n{}\n【生成的数据:】\n""",
+                        ], [task], """第一版"""],
+                    ]
                 for platform in records[-1][0]:
                     template = platform.format(*records[-1][1])
-                    prompt = template.replace('$示例数据$', example_str).replace('$输出格式$', output_format_str).replace('$输出限制$', output_limitation_str)
+                    prompt = template.replace('$示例数据$', example_str).replace('$输出格式$',
+                                                                                 output_format_str).replace(
+                        '$输出限制$', output_limitation_str)
                     raw_prompt.append(prompt)
             if use_llm:
-                records = [
-                    [[
-                        """请将【任务描述】改写为数据生成任务的【prompt】。\n一个prompt需要精练地说明生成任务的背景、生成目标、限制条件、示例、输出格式。$示例数据$\n$输出限制$\n$输出格式$\n【任务描述:】\n{}\n【prompt:】\n""",
-                        """请基于以下【任务描述】生成一个数据生成任务的【prompt】。生成的【prompt】应包括：生成任务的背景、生成目标、限制条件、示例、输出格式。$示例数据$\n$输出限制$\n$输出格式$\n【任务描述:】\n{}\n【prompt:】\n""",
-                    ], [task], """第一版"""],
-                ]
+                if self.has_pic:
+                    records = [
+                        [[
+                            """请基于以下【任务描述】生成一个数据生成任务的【prompt】。生成的【prompt】应包括：生成任务的背景、生成目标、限制条件、示例、输出格式。包含图片数量不应该多余20张。$示例数据$\n$输出限制$\n$输出格式$\n【任务描述:】\n{}\n【prompt:】\n""",
+                        ], [task], """第一版"""],
+                    ]
+                else:
+                    records = [
+                        [[
+                            """请将【任务描述】改写为数据生成任务的【prompt】。\n一个prompt需要精练地说明生成任务的背景、生成目标、限制条件、示例、输出格式。$示例数据$\n$输出限制$\n$输出格式$\n【任务描述:】\n{}\n【prompt:】\n""",
+                            """请基于以下【任务描述】生成一个数据生成任务的【prompt】。生成的【prompt】应包括：生成任务的背景、生成目标、限制条件、示例、输出格式。$示例数据$\n$输出限制$\n$输出格式$\n【任务描述:】\n{}\n【prompt:】\n""",
+                        ], [task], """第一版"""],
+                    ]
+                if self.no_example_in_prompt:
+                    output_limitation_str += '生成出的prompt里面不应该包含任何具体的示例，而是应该用文字对示例数据里面能产生重要影响的要点进行概括性地描述。'
                 for platform in records[-1][0]:
                     template = platform.format(*records[-1][1])
-                    template = template.replace('$示例数据$', example_str).replace('$输出格式$', output_format_str).replace('$输出限制$', output_limitation_str)
+                    template = template.replace('$示例数据$', example_str).replace('$输出格式$',
+                                                                                   output_format_str).replace(
+                        '$输出限制$', output_limitation_str)
                     prompt = self.call_llm(template)
                     raw_prompt.append(prompt)
-        elif self.task_kind == Classification:
+        elif self.task_kind in (Classification, CLSAnalysis):
             if use_rule:
                 records = [
                     [[
@@ -569,7 +786,13 @@ class AutoPrompt:
                 ]
                 for platform in records[-1][0]:
                     template = platform.format(*records[-1][1])
-                    template = template.replace('$示例数据$', example_str).replace('$输出格式$', output_format_str).replace('$输出限制$', output_limitation_str)
+                    if self.no_example_in_prompt:
+                        template = (template.replace('$输出格式$', output_format_str).
+                        replace('$输出限制$', output_limitation_str))
+                    else:
+                        template = (template.replace('$示例数据$', example_str).
+                        replace('$输出格式$', output_format_str).
+                        replace('$输出限制$', output_limitation_str))
                     raw_prompt.append(template)
         else:
             raise UndefinedTask
@@ -582,8 +805,19 @@ class AutoPrompt:
     def get_output_format_str(self, task, example_str):
         records = [
             [
-                """请分析【任务】的【示例数据】，然后结出这个任务的【输出格式】。\n\n【任务：】\n{}\n\n【示例数据：】\n{}\n\n【输出格式：】\n""",
+                """请分析【任务】的【示例数据】，然后结出这个任务的【输出格式】，如果示例数据不包含中文语应在输出格式里明确要求输出的语言。\n\n【任务：】\n{}\n\n【示例数据：】\n{}\n\n【输出格式：】\n""",
                 [task, example_str], """第一版"""],
+        ]
+        template = records[-1][0].format(*records[-1][1])
+        rst = self.call_llm(template)
+        return rst
+
+    def get_final_tips(self, label):
+        tips = self.label2tips[label]
+        records = [
+            [
+                """请整理有关标签{}的所有分类要点，注意不要遗漏任何信息，直接输出整理后的所有分类要点。要点里不应该包含任何图片。\n\n【信息：】\n{}\n\n【所有分类要点：】\n""",
+                [label, '\n'.join(tips)], """第一版"""],
         ]
         template = records[-1][0].format(*records[-1][1])
         rst = self.call_llm(template)
@@ -597,42 +831,49 @@ class AutoPrompt:
             add_header: bool = True,
             use_all: bool = False,
     ) -> str:
-        example_case = ''
-        if len(dataset) >= 1:
-            if add_header > 0:
-                example_case += '\n【示例数据:】\n'
-            data_texts = self.get_texts(dataset)
-            example_case += self.sampled_string(data_texts, min_num, max_num, use_all=use_all) + '\n'
-        return example_case
-
-    @staticmethod
-    def sampled_string(texts, min_num: int, max_num: int, use_all: bool):
         if use_all:
-            sampled_texts = texts
+            chosen_dataset = dataset
         else:
-            min_num = min(min_num, len(texts))
-            max_num = min(max_num, len(texts))
-            sampled_texts = sample(texts, randint(min_num, max_num))
-        return '\n'.join(sampled_texts)
+            min_num = min(min_num, len(dataset))
+            max_num = min(max_num, len(dataset))
+            chosen_dataset = sample(dataset, randint(min_num, max_num))
 
-    def get_output(self, prompt: str, target_input: str = None) -> str:
+        example_case = ''
+        data_pics = []
+        pic_type = ''
+        if len(chosen_dataset) >= 1:
+            if add_header:
+                example_case += '\n【示例数据:】\n'
+            data_texts, data_pics, pic_type = self.get_texts(dataset)
+            example_case += '\n'.join(data_texts)
+        return example_case, data_pics, pic_type
+
+    def get_output(self, prompt: str, target_input: Input) -> str:
         """
         用大模型基于prompt生成数据
         :param prompt:
         :param target_input:
         :return:
         """
-        if target_input is None or target_input == '':
+        target_input = self.update_input(target_input)
+        if target_input['text'] == '' and len(target_input['pic_list']) == 0:
             rst = self.call_llm(prompt)
         else:
-            rst = self.call_llm(prompt + '输入：\n{}\n输出：\n'.format(target_input))
+            new_input = {
+                'text': prompt + self.get_texts([('', '', target_input, '')])[0][0],
+                'pic_list': target_input['pic_list'],
+                'pic_type': target_input['pic_type'],
+            }
+            rst = self.call_llm(new_input)
         return rst
 
-    def rewrite_output(self, input_case: str, output_case: str):
+    def rewrite_output(self, input_info: str, output_info: str):
+        one_str, pic_list, pic_type = self.get_text((output_info, '', input_info, ''))
+        new_inputs = {'text': one_str, 'pic_list': pic_list, 'pic_type': pic_type}
         ans = self.get_cases(
             self.inspector_prompt,
             1,
-            [self.get_text((output_case, '', input_case, ''))],
+            [new_inputs],
             do_variety=False,
         )
         rw = ''
@@ -640,13 +881,13 @@ class AutoPrompt:
         if len(rst) == 2:
             if '无需修正' not in rw:
                 rw = rst[1]
-        sim = ngram_sim(output_case, rw, 3)
+        sim = ngram_sim(output_info, rw, 3)
         if sim >= 0.4:
             return rw
-        self.record.note(('>>> rewrite_input', self.get_text((output_case, '', input_case, ''))))
+        self.record.note(('>>> rewrite_input', self.get_text((output_info, '', input_info, ''))))
         self.record.note(('>>> rewrite_output', ans))
-        self.record.note(('>>> rewrite_text', output_case))
-        return output_case
+        self.record.note(('>>> rewrite_text', output_info))
+        return output_info
 
     def get_cases(
             self,
@@ -655,8 +896,8 @@ class AutoPrompt:
             inputs: List[str],
             dataset: List[LabeledCase] = None,
             do_variety=True,
-            use_example: bool = True,   # do_variety=True时才有效
-            multi_gen: bool = False,    # do_variety=True时才有效
+            use_example: bool = True,  # do_variety=True时才有效
+            multi_gen: bool = False,  # do_variety=True时才有效
             delete_same: bool = True,
             clean=False,
             num_consistent: bool = False,
@@ -696,16 +937,19 @@ class AutoPrompt:
                 else:
                     prompt_new = prompt
 
-                outputs = self.get_output(prompt_new, target_input=input_case).split('\n')
-
-                for output in outputs:
-                    output = output.strip()
-                    if delete_same:
-                        if output in rst:
+                output_ori = self.get_output(prompt_new, target_input=input_case)
+                if multi_gen:
+                    outputs = output_ori.split('\n')
+                    for output in outputs:
+                        output = output.strip()
+                        if delete_same:
+                            if output in rst:
+                                continue
+                        if len(output) == 0:
                             continue
-                    if len(output) == 0:
-                        continue
-                    rst.append(output)
+                        rst.append(output)
+                else:
+                    rst.append(output_ori)
 
                 if num_consistent:
                     # 分类任务必须严格生成input_size个结果，如果过多就截断，如果过少就补''
@@ -737,11 +981,11 @@ class AutoPrompt:
         return cases
 
     @staticmethod
-    def get_best_label(text, labels) -> tuple[str, float]:
+    def get_best_label(text, labels) -> Tuple[str, float]:
         label_score = []
         for label in labels:
             label_score.append([label, ngram_sim(text, label, 3)])
-        shuffle(label_score)    # 在分值全一样时增加随机性
+        shuffle(label_score)  # 在分值全一样时增加随机性
         label_score.sort(key=lambda x: x[1], reverse=True)
         return label_score[0][0], label_score[0][1]
 
@@ -780,7 +1024,7 @@ class AutoPrompt:
         if size is not None:
             assert len(size) == box_num
 
-        if size is None or min(size) > (ball_num // box_num + 1):
+        if size is None or min(size) >= (ball_num // box_num + 1):
             # 如果box_size的最小值大于ball_num // box_num + 1
             base_num = ball_num // box_num
             distribute = [base_num] * box_num
@@ -796,7 +1040,7 @@ class AutoPrompt:
                 fifo.extend([idx] * size)
             shuffle(fifo)
             distribute = [0] * box_num
-            for idx in fifo[:box_num]:
+            for idx in fifo[:ball_num]:
                 distribute[idx] += 1
         return distribute
 
@@ -808,18 +1052,25 @@ class AutoPrompt:
         :param cases:
         :return:
         """
-        records = [
-            [
-                """下列【原始数据】中包含多条为【任务】生成的数据，请过滤掉冗余的格式信息和背景描述，然后输出其中生成的数据（每行一条数据）。\n【任务:】\n{}\n【原始数据:】\n{}\n【清洗后的数据:】\n""",
-                [prompt, cases], """第一版"""],
-        ]
+        if self.has_pic:
+            records = [
+                [
+                    """下列【原始数据】中包含多条为【任务】生成的数据，请过滤掉冗余的格式信息和背景描述，包含图片数量不应该多余20张，然后输出其中生成的数据（每行一条数据）。\n【任务:】\n{}\n【原始数据:】\n{}\n【清洗后的数据:】\n""",
+                    [prompt, cases], """第一版"""],
+            ]
+        else:
+            records = [
+                [
+                    """下列【原始数据】中包含多条为【任务】生成的数据，请过滤掉冗余的格式信息和背景描述，然后输出其中生成的数据（每行一条数据）。\n【任务:】\n{}\n【原始数据:】\n{}\n【清洗后的数据:】\n""",
+                    [prompt, cases], """第一版"""],
+            ]
         template = records[-1][0].format(*records[-1][1])
         rst = self.call_llm(template)
         rst = [line for line in rst.split('\n') if len(line) > 0]
         return rst
 
     @staticmethod
-    def pick_dataset(dataset: List[LabeledCase], sign: str, num: int, target_idx: int = LabelIdx) -> list[LabeledCase]:
+    def pick_dataset(dataset: List[LabeledCase], sign: str, num: int, target_idx: int = LabelIdx) -> List[LabeledCase]:
         """
         基于结构化的标注数据dataset(输出，标签，输入，备注)，从target_idx例里选出和sign标签一样的数据里抽样num个
         TODO 目前只考虑good label
@@ -841,7 +1092,8 @@ class AutoPrompt:
         chosen_case = sample(matched_data, min(num, len(matched_data)))
         return chosen_case
 
-    def split_dataset(self, dataset: List[LabeledCase], length: int, balance_idx=None) -> Tuple[list[LabeledCase], list[LabeledCase]]:
+    def split_dataset(self, dataset: List[LabeledCase], length: int, balance_idx=None) -> Tuple[
+        List[LabeledCase], List[LabeledCase]]:
         # 将数据集切分成两份
         length = min(len(dataset), length)
 
@@ -850,17 +1102,24 @@ class AutoPrompt:
             tag2cases[''] = dataset
         else:
             for case in dataset:
-                tag2cases[case[balance_idx]].append(case)
+                # TODO 仅使用了 'text'
+                if isinstance(case[balance_idx], str):
+                    tag2cases[case[balance_idx]].append(case)
+                elif isinstance(case[balance_idx], dict) and 'text' in case[balance_idx]:
+                    tag2cases[case[balance_idx]['text']].append(case)
+                else:
+                    tag2cases['{}'.format(case[balance_idx])].append(case)
         dataset_1 = []
         dataset_2 = []
         tags = list(tag2cases.keys())
         tag_size = [len(tag2cases[tag]) for tag in tags]
         tag2num = self.average_split(length, len(tags), size=tag_size)
         for tag, num in zip(tags, tag2num):
-            if num == 0:
-                continue
             sub_dataset = tag2cases[tag]
-            selected_idx = sample(list(range(len(sub_dataset))), num)
+            if num == 0:
+                selected_idx = []
+            else:
+                selected_idx = sample(list(range(len(sub_dataset))), num)
             sub_dataset_1 = []
             sub_dataset_2 = []
             for idx, case in enumerate(sub_dataset):
@@ -872,42 +1131,79 @@ class AutoPrompt:
             dataset_2.extend(sub_dataset_2)
         return dataset_1, dataset_2
 
+    def get_input_str(self, the_input):
+        text = ''
+        pic_list = []
+        pic_type = ''
+        if 'text' in the_input:
+            text = the_input['text']
+        if 'pic_list' in the_input and len(the_input['pic_list']) > 0:
+            pic_list = the_input['pic_list']
+            pic_type = the_input['pic_type']
+            text = '$pic_note$'*len(pic_list) + text
+        return text, pic_list, pic_type
+
     @staticmethod
     def get_text(case: LabeledCase) -> str:
-        if case[InputIdx] == '':
+        pic_list = []
+        pic_type = ''
+        if len(case[InputIdx]) == 0:
             one_str = case[OutputIdx]
         else:
-            one_str = '输入：\n{}\n输出：\n{}\n'.format(case[InputIdx], case[OutputIdx])
+            if 'text' in case[InputIdx]:
+                text = case[InputIdx]['text']
+            if 'pic_list' in case[InputIdx]:
+                pic_list = case[InputIdx]['pic_list']
+                pic_type = case[InputIdx]['pic_type']
+                text = '$pic_note$'*len(pic_list) + text
+            one_str = '输入：\n{}\n输出：\n{}\n'.format(text, case[OutputIdx])
         if case[CommentIdx] != '':
             one_str += '备注：\n{}\n'.format(case[CommentIdx])
-        return one_str
+        return one_str, pic_list, pic_type
+
+    def fill_slot(self, text):
+        idx = 1
+        while '$pic_note$' in text:
+            p = '（关联第{}张图）'.format(idx)
+            text = text.replace('$pic_note$', p, 1)
+            idx += 1
+        return text
 
     def get_texts(self, cases: List[LabeledCase]) -> List[str]:
-        """Todo 没使用，待修改以便统一"""
         texts = []
+        pics = []
+
         for case in cases:
-            one_str = self.get_text(case)
+            one_str, pic_list, pic_type = self.get_text(case)
+            pics.extend(pic_list)
             texts.append(one_str)
-        return texts
+        return texts, pics, pic_type
 
     def analysis_case2good(
             self,
-            case_new: List[LabeledCase],
-            case_good: List[LabeledCase],
+            case_new_ori: List[LabeledCase],
+            case_good_ori: List[LabeledCase],
             task: str,
             wrong_cases_str: str = '',
+            label: str = '',
     ) -> str:
         """
         分析旧的生成数据和人工标注的优质数据之间的差异，并总结出需要对旧生成数据做什么修改
-        :param case_new:
-        :param case_good:
+        :param case_new_ori:
+        :param case_good_ori:
         :param task:
         :param wrong_cases_str:
         :return:
         """
-        case_new = self.get_example_str(case_new, add_header=False, use_all=True)
-        case_good = self.get_example_str(case_good, add_header=False, use_all=True)
-        if len(case_new) == 0:
+        whole_pic_list = []
+        whole_pic_type = ''
+        case_new, pics_new, pic_type_new = self.get_example_str(case_new_ori, add_header=False, use_all=True)
+        case_good, pics_good, pic_type_good = self.get_example_str(case_good_ori, add_header=False, use_all=True)
+        whole_pic_list.extend(pics_new)
+        whole_pic_list.extend(pics_good)
+        whole_pic_type = pic_type_good
+        if len(case_new) == 0 and self.task_kind != CLSAnalysis:
+            # CLSAnalysis 任务允许只对正确case做分析
             raise ValueError('cases is empty')
         if len(case_good) > 0:
             if self.task_kind == Generation:
@@ -932,7 +1228,30 @@ class AutoPrompt:
                 ]
                 template = records[-1][0].format(*records[-1][1])
                 if wrong_cases_str is not None and len(wrong_cases_str) > 0:
-                    template = template.replace('$错误数据$', '【错误分析：】\n' + wrong_cases_str + '\n')
+                    wrong_cases_str_text, wrong_cases_pic_lists, wrong_cases_pic_type = wrong_cases_str
+                    whole_pic_list.extend(wrong_cases_pic_lists)
+                    template = template.replace('$错误数据$', '【错误分析：】\n' + wrong_cases_str_text + '\n')
+                else:
+                    template = template.replace('$错误数据$', '')
+            elif self.task_kind == CLSAnalysis:
+                if len(case_new) > 0:
+                    records = [
+                        [
+                            """基于分类任务的【任务描述:】{}\n请对比观察【当前分类结果】和【标准答案】，总结出{}类别的判断标准。\n【当前分类结果：】\n{}\n【标准答案：】\n{}\n$错误数据$总结出的【{}类别的判断标准：】\n""",
+                            [task, label, case_new, case_good, label], """提供task做背景知识"""],
+                    ]
+                else:
+                    # 无负例
+                    records = [
+                        [
+                            """基于分类任务的【任务描述:】{}\n请对比观察【标准答案】，总结出{}类别的判断标准。\n【标准答案：】\n{}\n$错误数据$总结出的【{}类别的判断标准：】\n""",
+                            [task, label, case_good, label], """提供task做背景知识"""],
+                    ]
+                template = records[-1][0].format(*records[-1][1])
+                if wrong_cases_str is not None and len(wrong_cases_str) > 0:
+                    wrong_cases_str_text, wrong_cases_pic_lists, wrong_cases_pic_type = wrong_cases_str
+                    whole_pic_list.extend(wrong_cases_pic_lists)
+                    template = template.replace('$错误数据$', '【错误分析：】\n' + wrong_cases_str_text + '\n')
                 else:
                     template = template.replace('$错误数据$', '')
             else:
@@ -945,7 +1264,7 @@ class AutoPrompt:
                         [task, case_new], """提供task做背景知识"""],
                 ]
                 template = records[-1][0].format(*records[-1][1])
-            elif self.task_kind == Classification:
+            elif self.task_kind in (Classification, CLSAnalysis):
                 records = [
                     [
                         """基于分类任务的【任务描述:】{}\n请观察【当前分类结果】，总结出需要补充的【分类判断标准】。\n【当前分类结果：】\n{}\n需要补充的【分类判断标准：】\n""",
@@ -954,7 +1273,8 @@ class AutoPrompt:
                 template = records[-1][0].format(*records[-1][1])
             else:
                 raise UndefinedTask
-        rst = self.call_llm(template)
+        template = self.fill_slot(template)
+        rst = self.call_llm({'text': template, 'pic_list': whole_pic_list, 'pic_type': whole_pic_type})
         return rst
 
     def clean_prompt(self, prompt):
@@ -965,11 +1285,25 @@ class AutoPrompt:
                     """请对【原prompt】进行修改，并输出【修正后的prompt】。prompt里不应该出现“已有历史数据”、“相比优质数据”、“原prompt”等类似的表达，因为一个prompt应该是独立且完整的不依赖任何其他任务的结果。在保持【原prompt】的信息不遗漏的情况下整理其格式，不要遗漏原prompt里任何信息，按任务背景、数据要求、示例分析、输出格式的结构进行组织。直接输出修正后的prompt，不要输出修改过程。\n【原prompt：】\n{}\n【修正后的prompt：】\n""",
                     [prompt], """第一版"""],
             ]
-        elif self.task_kind == Classification:
+        elif self.task_kind in (Classification, CLSAnalysis):
             records = [
                 [
                     """请对【原prompt】进行修改，并输出【修正后的prompt】。prompt里不应该出现“已有历史数据”、“相比标准答案”、“原prompt”等类似的表达，因为一个prompt应该是独立且完整的不依赖任何其他任务的结果。在保持【原prompt】的信息不遗漏的情况下整理其格式，不要遗漏原prompt里任何信息，按任务的背景、分类标准、限制条件、示例数据、输出格式的结构进行组织。直接输出修正后的prompt，不要输出修改过程。\n【原prompt：】\n{}\n【修正后的prompt：】\n""",
                     [prompt], """第一版"""],
+            ]
+        else:
+            raise UndefinedTask
+        template = records[-1][0].format(*records[-1][1])
+        rst = self.call_llm(template)
+        return rst
+
+    def merge_prompt(self, prompt, tips):
+        """更新tips"""
+        if self.task_kind in (CLSAnalysis, Classification, Generation):
+            records = [
+                [
+                    """请对【原prompt】进行修改，将【要点】融合进去。融合进去后的prompt的格式要和原prompt一致。融合后不应该丢失任何原prompt里面的信息。要直接输出融合后的prompt，不要输出修改过程。\n【原prompt：】\n{}\n【要点：】\n{}\n【融合后的prompt：】\n""",
+                    [prompt, tips], """第一版"""],
             ]
         else:
             raise UndefinedTask
@@ -999,8 +1333,13 @@ class AutoPrompt:
         背景：已生成一些关于赞美、祝福、励志、正能量主题的【历史数据】，但与【优质数据】相比存在不足。
         示例：【优质数据】中的“积极向上永不言弃”，简单直接地表达了励志主题，这就是我们想要达到的风格。
         """
-        case_old = self.get_example_str(case_old, add_header=False, use_all=True)
-        case_good = self.get_example_str(case_good, add_header=False, use_all=True)
+        whole_pic_list = []
+        whole_pic_type = ''
+        case_old, pics_old, pic_type_old = self.get_example_str(case_old, add_header=False, use_all=True)
+        case_good, pics_good, pic_type_good = self.get_example_str(case_good, add_header=False, use_all=True)
+        whole_pic_list.extend(pics_old)
+        whole_pic_list.extend(pics_good)
+        whole_pic_type = pic_type_old
 
         if len(case_good) > 0:
             if self.task_kind == Generation:
@@ -1009,19 +1348,34 @@ class AutoPrompt:
                         """请参考【修改意见】，对【prompt】进行改写。【改写后的prompt】需要基于【修改意见】进行修改，并精练地说明生成任务的背景、生成目标、限制条件、输出格式、示例数据。\n【修改意见:】\n{}\n【prompt:】\n{}\n【改写后的prompt:】\n""",
                         [propose, prompt], """第一版"""],
                     [
-                        """【历史数据】是由【prompt】生成，和【优质数据】对比起来还有一些不足。为了生成和【优质数据】更接近的数据，需要参考【历史数据】、【优质数据】和【修改意见】对【prompt】进行改写，并输出【改写后的prompt】，注意改写后的prompt不应该包含文本“历史数据”，“优质数据”，注意改写后的prompt是一个独立且完整的任务描述。改写后的prompt应精练地说明生成任务的背景、生成目标、限制条件、示例数据、输出格式。。\n【历史数据:】\n{}\n【优质数据:】\n{}\n【修改意见:】\n{}\n【prompt:】\n{}\n【改写后的prompt:】\n""",
+                        """【历史数据】是由【prompt】生成，和【优质数据】对比起来还有一些不足。为了生成和【优质数据】更接近的数据，需要参考【历史数据】、【优质数据】和【修改意见】对【prompt】进行改写，并输出【改写后的prompt】，注意改写后的prompt不应该包含文本“历史数据”，“优质数据”，注意改写后的prompt是一个独立且完整的任务描述。改写后的prompt应精练地说明生成任务的背景、生成目标、限制条件、示例数据、输出格式(如果示例数据不包含中文语应在输出格式里明确要求输出的语言)。如果原prompt里有双括号包裹的变量{{变量名}}，则输出的prompt里也应该包含所有双括号包裹的变量，不要丢失变量。\n【历史数据:】\n{}\n【优质数据:】\n{}\n【修改意见:】\n{}\n【prompt:】\n{}\n【改写后的prompt:】\n""",
                         [case_old, case_good, propose, prompt], """第一版"""],
                 ]
                 template = records[-1][0].format(*records[-1][1])
             elif self.task_kind == Classification:
-                records = [
-                    [
-                        """【历史分类结果：】是由用分类任务的【原prompt】生成的，和【标准答案】对比起来还有一些不足。为了让分类结果更加精准，需要参考【分类结果】、【标准答案】和【修改意见】对【原prompt】进行优化，并输出【优化后的prompt】，注意优化后的prompt不应该包含文本“历史分类结果”，“标准答案”等字样，优化后的prompt依然是一个独立且完整的任务描述。优化后的prompt应说明分类任务的背景、分类标准、限制条件、示例数据、输出格式。优化后的prompt应尽量包含修改意见里的总结出的要点，只要原prompt里面没有对子任务分别做要求，那么就应尽量去掉修改意见里总结出的要点的适用范围限制，使这些要点能应用到增个任务的生成中。\n【历史分类结果:】\n{}\n【标准答案:】\n{}\n$错误数据$【修改意见:】\n{}\n【prompt:】\n{}\n【优化后的prompt:】\n""",
-                        [case_old, case_good, propose, prompt], """第一版"""],
-                ]
+                if self.no_example_in_prompt:
+                    records = [
+                        [
+                            """【历史分类结果：】是由用分类任务的【原prompt】生成的，和【标准答案】对比起来还有一些不足。为了让分类结果更加精准，需要参考【分类结果】、【标准答案】和【修改意见】对【原prompt】进行优化，并输出【优化后的prompt】，注意优化后的prompt不应该包含文本“历史分类结果”，“标准答案”等字样，优化后的prompt依然是一个独立且完整的任务描述。优化后的prompt应说明分类任务的背景、分类标准、限制条件、输出格式(如果示例数据不包含中文语应在输出格式里明确要求输出的语言)。优化后的prompt应尽量包含修改意见里的总结出的要点，只要原prompt里面没有对子任务分别做要求，那么就应尽量去掉修改意见里总结出的要点的适用范围限制，使这些要点能应用到整个任务的生成中。优化后的prompt必须包含对不同类别分类要求的分析（注意，生成出的prompt里面不应该包含任何具体的示例，而是应该用文字对示例数据里面能产生重要影响的要点进行概括性地描述。）。如果原prompt里有双括号包裹的变量{{变量名}}，则输出的prompt里也应该包含所有双括号包裹的变量，不要丢失变量。\n【历史分类结果:】\n{}\n【标准答案:】\n{}\n$错误数据$【修改意见:】\n{}\n【prompt:】\n{}\n【优化后的prompt:】\n""",
+                            [case_old, case_good, propose, prompt], """"""],
+                    ]
+                else:
+                    records = [
+                        [
+                            """【历史分类结果：】是由用分类任务的【原prompt】生成的，和【标准答案】对比起来还有一些不足。为了让分类结果更加精准，需要参考【分类结果】、【标准答案】和【修改意见】对【原prompt】进行优化，并输出【优化后的prompt】，注意优化后的prompt不应该包含文本“历史分类结果”，“标准答案”等字样，优化后的prompt依然是一个独立且完整的任务描述。优化后的prompt应说明分类任务的背景、分类标准、限制条件、示例数据、输出格式。优化后的prompt应尽量包含修改意见里的总结出的要点，只要原prompt里面没有对子任务分别做要求，那么就应尽量去掉修改意见里总结出的要点的适用范围限制，使这些要点能应用到增个任务的生成中。\n【历史分类结果:】\n{}\n【标准答案:】\n{}\n$错误数据$【修改意见:】\n{}\n【prompt:】\n{}\n【优化后的prompt:】\n""",
+                            [case_old, case_good, propose, prompt], """第一版"""],
+                        [
+                            """【历史分类结果：】是由用分类任务的【原prompt】生成的，和【标准答案】对比起来还有一些不足。为了让分类结果更加精准，需要参考【分类结果】、【标准答案】和【修改意见】对【原prompt】进行优化，并输出【优化后的prompt】，注意优化后的prompt不应该包含文本“历史分类结果”，“标准答案”等字样，优化后的prompt依然是一个独立且完整的任务描述。优化后的prompt应说明分类任务的背景、分类标准、限制条件、示例数据（示例数据部分的字数不应超过1000个字。如果示例字数过多，尽量选择有代表性的示例，并通过凝练示例里的关键信息来减少字数）、输出格式。优化后的prompt应尽量包含修改意见里的总结出的要点，只要原prompt里面没有对子任务分别做要求，那么就应尽量去掉修改意见里总结出的要点的适用范围限制，使这些要点能应用到增个任务的生成中。\n【历史分类结果:】\n{}\n【标准答案:】\n{}\n$错误数据$【修改意见:】\n{}\n【prompt:】\n{}\n【优化后的prompt:】\n""",
+                            [case_old, case_good, propose, prompt], """修正prompt里case数量过多"""],
+                        [
+                            """【历史分类结果：】是由用分类任务的【原prompt】生成的，和【标准答案】对比起来还有一些不足。为了让分类结果更加精准，需要参考【分类结果】、【标准答案】和【修改意见】对【原prompt】进行优化，并输出【优化后的prompt】，注意优化后的prompt不应该包含文本“历史分类结果”，“标准答案”等字样，优化后的prompt依然是一个独立且完整的任务描述。优化后的prompt应说明分类任务的背景、分类标准、限制条件、示例数据（示例数据部分的字数不应超过500个字。如果示例字数过多，尽量选择有代表性的示例，并通过凝练示例里的关键信息来减少字数）、输出格式(如果示例数据不包含中文语应在输出格式里明确要求输出的语言)。优化后的prompt应尽量包含修改意见里的总结出的要点，只要原prompt里面没有对子任务分别做要求，那么就应尽量去掉修改意见里总结出的要点的适用范围限制，使这些要点能应用到增个任务的生成中。优化后的prompt必须包含对不同类别分类要求的分析（字数不限）和示例（不超过500字）。如果原prompt里有双括号包裹的变量{{变量名}}，则输出的prompt里也应该包含所有双括号包裹的变量，不要丢失变量。\n【历史分类结果:】\n{}\n【标准答案:】\n{}\n$错误数据$【修改意见:】\n{}\n【prompt:】\n{}\n【优化后的prompt:】\n""",
+                            [case_old, case_good, propose, prompt], """修正prompt里case数量过多"""],
+                    ]
                 template = records[-1][0].format(*records[-1][1])
                 if wrong_cases_str is not None and len(wrong_cases_str) > 0:
-                    template = template.replace('$错误数据$', '【错误分析：】\n' + wrong_cases_str + '\n')
+                    wrong_cases_str_text, wrong_cases_pic_lists, wrong_cases_pic_type = wrong_cases_str
+                    whole_pic_list.extend(wrong_cases_pic_lists)
+                    template = template.replace('$错误数据$', '【错误分析：】\n' + wrong_cases_str_text + '\n')
                 else:
                     template = template.replace('$错误数据$', '')
             else:
@@ -1030,7 +1384,7 @@ class AutoPrompt:
             if self.task_kind == Generation:
                 records = [
                     [
-                        """【历史数据】是由【prompt】生成。为了生成质量更好的数据，需要参考【历史数据】和【修改意见】对【prompt】进行改写，并输出【改写后的prompt】。【改写后的prompt】应精练地说明生成任务的背景、生成目标、限制条件、示例数据、输出格式。\n【历史数据:】\n{}\n【修改意见:】\n{}\n【prompt:】\n{}\n【改写后的prompt:】\n""",
+                        """【历史数据】是由【prompt】生成。为了生成质量更好的数据，需要参考【历史数据】和【修改意见】对【prompt】进行改写，并输出【改写后的prompt】。【改写后的prompt】应精练地说明生成任务的背景、生成目标、限制条件、示例数据、输出格式(如果示例数据不包含中文语应在输出格式里明确要求输出的语言)。如果原prompt里有双括号包裹的变量{{变量名}}，则输出的prompt里也应该包含所有双括号包裹的变量，不要丢失变量。\n【历史数据:】\n{}\n【修改意见:】\n{}\n【prompt:】\n{}\n【改写后的prompt:】\n""",
                         [case_old, propose, prompt], """第一版"""],
                 ]
                 template = records[-1][0].format(*records[-1][1])
@@ -1039,11 +1393,15 @@ class AutoPrompt:
                     [
                         """【当前分类结果】是用分类任务的【prompt】生成的。为了生成质量更好的数据，需要参考【当前分类结果】和【修改意见】对【prompt】进行优化，并输出【优化后的prompt】。【优化后的prompt不应该包含文本“历史分类结果”，“标准答案”等字样，优化后的prompt依然是一个独立且完整的任务描述。【优化后的prompt】应说明分类任务的背景、分类标准、限制条件、示例数据、输出格式。\n【历史数据:】\n{}\n【修改意见:】\n{}\n【prompt:】\n{}\n【改写后的prompt:】\n""",
                         [case_old, propose, prompt], """第一版"""],
+                    [
+                        """【当前分类结果】是用分类任务的【prompt】生成的。为了生成质量更好的数据，需要参考【当前分类结果】和【修改意见】对【prompt】进行优化，并输出【优化后的prompt】。【优化后的prompt不应该包含文本“历史分类结果”，“标准答案”等字样，优化后的prompt依然是一个独立且完整的任务描述。【优化后的prompt】应说明分类任务的背景、分类标准、限制条件、示例数据、输出格式(如果示例数据不包含中文语应在输出格式里明确要求输出的语言)。优化后的prompt必须包含对不同类别分类要求的分析（字数不限）和示例（不超过500字）。如果原prompt里有双括号包裹的变量{{变量名}}，则输出的prompt里也应该包含所有双括号包裹的变量，不要丢失变量。\n【历史数据:】\n{}\n【修改意见:】\n{}\n【prompt:】\n{}\n【改写后的prompt:】\n""",
+                        [case_old, propose, prompt], """第二版"""],
                 ]
                 template = records[-1][0].format(*records[-1][1])
             else:
                 raise UndefinedTask
-        rst = self.call_llm(template)
+        template = self.fill_slot(template)
+        rst = self.call_llm({'text': template, 'pic_list': whole_pic_list, 'pic_type': whole_pic_type})
         rst = self.clean_prompt(rst)
         return rst
 
@@ -1126,10 +1484,10 @@ class AutoPrompt:
 
     def verify_data(self, prompt: str, size: int, inputs: List[str]) -> None:
         # 基于prompt生成数据
-        if prompt in self.prompt2case:
+        if prompt in self.prompt2case and not self.skip_old_data:
             return
         cases = self.get_cases(prompt, size, inputs, do_variety=False)
-       
+
         self.record.note(('prompt', prompt))
         if len(cases) > 0:
             self.prompt2case[prompt] = cases
@@ -1137,23 +1495,10 @@ class AutoPrompt:
         else:
             self.record.note(('cases generated Fail', ''))
 
-    def gradient_and_update(self, prompt: str, dataset: List[LabeledCase], task: str):
+    def gradient_and_update(self, prompt: str, validate: List[LabeledCase], task: str):
         # 计算梯度并更新prompt
         if prompt not in self.prompt2case:
             return []
-
-        if self.task_kind == Generation:
-            # 对于生成任务，每次求梯度时都随机采样一批数据作为验证集
-            self.record.note(('prompt', prompt))
-            # 采样好的数据
-            validate = self.pick_dataset(dataset, self.label_good, self.window_size)
-            # 采样差的数据
-            pass
-        elif self.task_kind == Classification:
-            # 对于分类任务，总是使用同一个验证集
-            validate = self.validate_cases
-        else:
-            raise UndefinedTask
 
         new_prompts = []
         for _ in range(self.derive_time):
@@ -1170,7 +1515,8 @@ class AutoPrompt:
             self.prompt2gradient[prompt].append(propose)
 
             # 更新prompt
-            prompt_updated = self.update_prompt(prompt, propose, self.prompt2case[prompt], validate, wrong_cases_str=wrong_cases_str)
+            prompt_updated = self.update_prompt(prompt, propose, self.prompt2case[prompt], validate,
+                                                wrong_cases_str=wrong_cases_str)
             new_prompts.append(prompt_updated)
             self.record.note(('propose', propose))
             self.record.note(('prompt_updated', prompt_updated))
@@ -1179,6 +1525,8 @@ class AutoPrompt:
     def check_response(self, respond_cases, validate_cases):
         right_cases, wrong_cases, wrong_outputs = [], [], []
         for respond_case, validate_case in zip(respond_cases, validate_cases):
+            if respond_case[InputIdx] != validate_case[InputIdx]:
+                xxx = 1
             assert respond_case[InputIdx] == validate_case[InputIdx]
             respond_reformat = self.get_reformat_text(respond_case[OutputIdx])
             validate_reformat = self.get_reformat_text(validate_case[OutputIdx])
@@ -1189,15 +1537,19 @@ class AutoPrompt:
                 wrong_outputs.append(respond_case[OutputIdx])
         return right_cases, wrong_cases, wrong_outputs
 
-    @staticmethod
-    def get_wrong_cases_str(wrong_cases, wrong_outputs):
-        rst = []
+    def get_wrong_cases_str(self, wrong_cases, wrong_outputs):
+        texts = []
+        pic_lists = []
+        pic_type = ''
         for case, output in zip(wrong_cases, wrong_outputs):
-            one_str = '对于输入：\n{}\n正确输出是：\n{}\n但却给出了以下错误输出：\n{}\n'.format(case[InputIdx], case[OutputIdx], output)
+            text, pic_list, pic_type = self.get_input_str(case[InputIdx])
+            pic_lists.extend(pic_list)
+            pic_type = pic_type
+            one_str = '对于输入：\n{}\n正确输出是：\n{}\n但却给出了以下错误输出：\n{}\n'.format(text, case[OutputIdx], output)
             if case[CommentIdx] != '':
                 one_str += '备注：\n{}\n'.format(case[CommentIdx])
-            rst.append(one_str)
-        return '\n'.join(rst)
+            texts.append(one_str)
+        return '\n'.join(texts), pic_lists, pic_type
 
     def get_rank_score(self, prompts: List[str], dataset: List[LabeledCase], task: str):
         checked_prompts = []
@@ -1211,7 +1563,7 @@ class AutoPrompt:
             for prompt_1 in tqdm(checked_prompts, desc='get rank score'):
                 for prompt_2 in checked_prompts:
                     if prompt_1 == prompt_2:
-                        good = self.get_texts(self.pick_dataset(dataset, self.label_good, self.window_size))
+                        good, pics, pic_type = self.get_texts(self.pick_dataset(dataset, self.label_good, self.window_size))
                         self.record.note(('good', good))
                         verify_rst, verify_signal = self.verify(self.prompt2case[prompt_1], self.prompt2case[prompt_2],
                                                                 good, task)
@@ -1235,10 +1587,14 @@ class AutoPrompt:
 
     def get_prompt_precision(self, prompt, is_lenient=False) -> float:
         """is_lenient == True 时为宽松的统计模式，在分类结果不完全正确的情况下会酌情给分，以便做更精准的排序"""
-        if prompt in self.prompt2precision:
+        if prompt in self.prompt2precision and not self.skip_old_data:
             return self.prompt2precision[prompt]
         cand_cases = self.prompt2case[prompt]
-        return self.get_precision(cand_cases, self.validate_cases, is_lenient=is_lenient)
+        score = self.get_precision(cand_cases,
+                                   self.validate_cases_fixed + self.validate_cases_new + self.validate_cases_hard,
+                                   is_lenient=is_lenient)
+        self.prompt2precision[prompt] = score
+        return score
 
     @staticmethod
     def get_reformat_text(text):
@@ -1255,8 +1611,14 @@ class AutoPrompt:
             output2_reformat = self.get_reformat_text(output2)
             if output1_reformat == output2_reformat:
                 right_count += 1
-            elif is_lenient:
-                right_count += ngram_sim(output1_reformat, output2_reformat)
+            else:
+                # 记录hardcase
+                if case2 not in (self.validate_cases_fixed + self.validate_cases_hard):
+                    self.record.note(('hard_case', case2))
+                    self.validate_cases_hard_next.append(case2)
+                # 做宽松计分
+                if is_lenient:
+                    right_count += ngram_sim(output1_reformat, output2_reformat, 2)
 
         precision = right_count / len(cases1)
         return precision
@@ -1270,34 +1632,61 @@ class AutoPrompt:
         :param iteration: 剩余的迭代轮次
         :return:
         """
+        self.record.note(('iteration', iteration))
         if iteration == 0:
             for prompt in prompts:
                 self.record.note(('final_prompts', prompt))
                 if prompt in self.prompt2case:
                     self.record.note(('final_case', self.prompt2case[prompt]))
+            if self.use_all_propose:
+                new_prompts = []
+                all_proposes = []
+                for gradients in self.prompt2gradient.values():
+                    all_proposes.extend(gradients)
+                all_proposes_text = '\n'.join(all_proposes)
+                for prompt in prompts:
+                    new_prompt = self.merge_prompt(prompt, all_proposes_text)
+                    new_prompts.append(new_prompt)
+                prompts = new_prompts
+                self.record.note(('prompts with all propose', prompts), max_char=100000)
             return prompts
 
         explored_prompt = []  # 梯度更新后的prompt
         if self.task_kind == Generation:
             input2dataset = self.aggregate_dataset(dataset)
             inputs = list(input2dataset.keys())
-            window_size = self.window_size
+            # 对于生成任务，每次求梯度时都随机采样一批数据作为验证集
+            validate = self.pick_dataset(dataset, self.label_good, self.window_size)
         elif self.task_kind == Classification:
-            inputs = self.validate_inputs
-            window_size = len(self.validate_inputs)
+            # 分类任务按窗口大小遍历所有训练数据
+            self.validate_cases_new = self.good_cases[
+                                      self.validate_new_idx: self.validate_new_idx + self.window_size_new]
+            self.validate_new_idx += self.window_size_new
+            if self.validate_new_idx >= len(self.good_cases):
+                self.validate_new_idx = 0
+            validate = self.validate_cases_fixed + self.validate_cases_new + self.validate_cases_hard
         else:
             raise ValueError("unexpected task", self.task_kind)
+
+        inputs = [case[InputIdx] for case in validate]
+        window_size = len(inputs)
         for prompt in prompts:
             self.verify_data(prompt, window_size, inputs)  # 为prompt生成数据
-            new_prompts = self.gradient_and_update(prompt, dataset, task)  # 得到新的prompt
+            new_prompts = self.gradient_and_update(prompt, validate, task)  # 得到新的prompt
             explored_prompt.extend(new_prompts)
-        for prompt in explored_prompt:
+        for idx, prompt in enumerate(explored_prompt):
+            self.prompt2idx[prompt] = 'iter_{}_{}'.format(iteration, idx)
             self.verify_data(prompt, window_size, inputs)
+
         prompt_score = self.get_rank_score(prompts + explored_prompt, dataset, task)
         prompt_selected = [prompt for prompt, score in prompt_score[:self.beam_size]]
+        self.validate_cases_hard += self.validate_cases_hard_next
+        self.validate_cases_hard = self.validate_cases_hard[
+                                   max(len(self.validate_cases_hard) - self.window_size_hard, 0):]
         self.record.note(('explored_prompt', explored_prompt))
         for prompt, score in prompt_score:
-            self.record.note(('In Rank Prompt', prompt))
+            self.record.note(('Prompt', prompt))
+            self.record.note(('Prompt Idx', self.prompt2idx[prompt]))
             self.record.note(('In Rank Score', score))
         self.record.note(('prompt_selected', prompt_selected))
         return self.beam_search(task, prompt_selected, dataset, iteration - 1)

@@ -28,7 +28,9 @@ from enum import Enum
 import requests
 from tqdm import tqdm
 from aitool import WEB_PATH, DATA_PATH, make_dir, is_file_exist, is_writable, unzip, timestamp, split_path
+import socket
 
+socket.setdefaulttimeout(5)
 
 def get_download_dir():
     """
@@ -141,8 +143,12 @@ def download_file(
                     file.write(data)
         if show:
             print("Download {} successfully! {}".format(url, timestamp()))
-    except (error.HTTPError, error.URLError) as e:
+    except socket.timeout:
+        print("下载超时")
+        return ''
+    except Exception as e:
         print(e)
+        return ''
     return filename
 
 
@@ -336,6 +342,9 @@ def extract_archive(from_path: str, to_path: Optional[str] = None, remove_finish
 
 
 if __name__ == '__main__':
-    import doctest
+    link = 'https://www.baidu1.com/img/PCtm_d9c8750bed0b3c7d089fa7d55720d6cf.png'
+    print(download_file(link, './x.jpg', show=True))
 
-    doctest.testmod()
+    # import doctest
+    #
+    # doctest.testmod()

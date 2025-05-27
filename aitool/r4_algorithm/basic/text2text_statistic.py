@@ -288,7 +288,7 @@ class Text2Text(object):
 
 
 if __name__ == "__main__":
-    file_text2names = '/Users/bytedance/card-effect-editor/model_docs/生成_用户描述2名称_1225.xlsx'
+    file_text2names = '生成_用户描述2名称_1225.xlsx'
     _data = load_excel(file_text2names, to_list=True)
     q2a = []
     for line in tqdm(_data, "format qa"):
